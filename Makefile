@@ -1,20 +1,20 @@
 NVCC=nvcc
-CUDAFLAGS= -arch=sm_30
+CUDAFLAGS=
 OPT= -g -G
 
-all: file
+all: main
 
-main: file.o generate.o
-	${NVCC} ${OPT} -o main file.o generate.o
+main: main.o generate.o
+	${NVCC} ${OPT} -o main main.o generate.o
 
-generate.o: file.cuh generate.cpp
+generate.o: generate.cpp
 	${NVCC} ${OPT} ${CUDAFLAGS} -std=c++11 -c generate.cpp
 
-file.o: file.cuh file.cu
-	$(NVCC) ${OPT} $(CUDAFLAGS) -std=c++11 -c file.cu
-
-file: file.o generate.o
-	${NVCC} ${CUDAFLAGS} -o file file.o generate.o
+main.o: main.cu
+	$(NVCC) ${OPT} $(CUDAFLAGS) -std=c++11 -c main.cu
 
 clean:
-	rm *.o file
+	rm *.o main
+
+prof: main.o
+	nvprof ./main
