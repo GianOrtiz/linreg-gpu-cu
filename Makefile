@@ -1,5 +1,5 @@
 NVCC=nvcc
-CUDAFLAGS=
+CUDAFLAGS=-arch=native
 OPT= -g -G
 
 all: main
