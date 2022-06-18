@@ -10,6 +10,9 @@ main: main.o
 main.o: main.cu
 	$(NVCC) ${OPT} $(CUDAFLAGS) -std=c++11 -c main.cu
 
+run: main
+	./main
+
 clean:
 	rm *.o main
 
