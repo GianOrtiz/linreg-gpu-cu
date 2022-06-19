@@ -33,11 +33,15 @@ template <class T, size_t TElemCount>
 class circular_buffer
 {
 public:
-  explicit circular_buffer() = default;
+  // circular_buffer() = default;
+  explicit circular_buffer()
+  {
+    buf_ = {};
+  }
 
   void put(T item)
   {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     buf_[head_] = item;
 
@@ -69,7 +73,7 @@ public:
 
   T get()
   {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     // if (empty())
     // {
@@ -86,7 +90,7 @@ public:
 
   void reset()
   {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // std::lock_guard<std::recursive_mutex> lock(mutex_);
     head_ = tail_;
     full_ = false;
   }
@@ -94,7 +98,7 @@ public:
   bool empty()
   {
     // Can have a race condition in a multi-threaded application
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // std::lock_guard<std::recursive_mutex> lock(mutex_);
     // if head and tail are equal, we are empty
     return (!full_ && (head_ == tail_));
   }
@@ -115,7 +119,7 @@ public:
     // A lock is needed in size ot prevent a race condition, because head_, tail_, and full_
     // can be updated between executing lines within this function in a multi-threaded
     // application
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     size_t size = TElemCount;
 
@@ -135,29 +139,24 @@ public:
   }
 
 private:
-  mutable std::recursive_mutex mutex_;
+  // mutable std::recursive_mutex mutex_;
   mutable std::array<T, TElemCount> buf_;
   mutable size_t head_ = 0;
   mutable size_t tail_ = 0;
   mutable bool full_ = 0;
 };
 
-const int N = 16;
-const int SIZE = N * N;
 const int WINDOW = 100;
 
 const uint BUFFER_SIZE = 10000;
 class Block
 {
-  float data[BUFFER_SIZE];
   uint index;
 
 public:
-  Block(float data[BUFFER_SIZE], uint index)
-  {
-    std::copy(data, data + BUFFER_SIZE, this->data);
-    this->index = index;
-  };
+  Block() = default;
+  std::array<float, BUFFER_SIZE> data;
+  Block(std::array<float, BUFFER_SIZE> data, uint index) : data(data), index(index){};
 };
 
 class Reader
@@ -168,7 +167,8 @@ public:
   bool done = false;
   uint read_until = 0;
   circular_buffer<Block, Reader::BUFFER_COUNT> value_buffer;
-  explicit Reader() = default;
+  explicit Reader(){};
+  // explicit Reader() = default;
   float *read(std::string filename)
   {
     std::ifstream in_file(filename, std::ifstream::binary);
@@ -186,8 +186,8 @@ public:
       while (value_buffer.full())
       {
       }
-      float *read_buffer = new float[BUFFER_SIZE];
-      in_file.read((char *)read_buffer, BUFFER_SIZE * sizeof(float));
+      std::array<float, BUFFER_SIZE> read_buffer;
+      in_file.read((char *)read_buffer.data(), BUFFER_SIZE * sizeof(float));
       value_buffer.put(Block(read_buffer, read_until));
       read_until += BUFFER_SIZE;
     }
@@ -199,16 +199,16 @@ public:
 class DataScheduler
 {
   static const size_t BUFFER_COUNT = 100;
+  static const size_t OUT_BUFFER_COUNT = 100;
   Reader *reader;
   uint processed_until = 0;
   // circular_buffer<Block, DataScheduler::BUFFER_COUNT> *device_buffer;
 
 public:
-  DataScheduler(Reader *reader)
-  {
-    this->reader = reader;
-    // cudaCheck(cudaMalloc(&device_buffer, sizeof(circular_buffer<float, DataScheduler::BUFFER_COUNT>)));
-  }
+  bool done = false;
+  // must write to buffer in the given order(ascending block index)
+  circular_buffer<Block, DataScheduler::OUT_BUFFER_COUNT> out_buffer;
+  explicit DataScheduler(Reader *reader) : reader(reader){};
 
   void loop()
   {
@@ -221,10 +221,52 @@ public:
       auto block = reader->value_buffer.get();
       // device_buffer->gpu_put(&block);
     }
+    done = true;
+  }
+};
+
+class Writer
+{
+  static const size_t BUFFER_COUNT = 100;
+
+public:
+  bool done = false;
+  DataScheduler *scheduler;
+  Writer(DataScheduler *scheduler) : scheduler(scheduler){};
+  float *write(std::string filename)
+  {
+    std::ofstream out_file(filename, std::ofstream::binary);
+    if (!out_file)
+    {
+      std::cerr << "Failed opening file" << std::endl;
+      exit(1);
+    }
+
+    while (!scheduler->done)
+    {
+      while (scheduler->out_buffer.empty())
+        ;
+      out_file.write((char *)scheduler->out_buffer.get().data.data(), BUFFER_SIZE * sizeof(float));
+    }
+    done = true;
+    out_file.close();
   }
 };
 
 int main()
 {
-  Reader reader();
+  std::cout << "Initializing Reader..." << std::endl;
+  Reader reader;
+  std::cout << "Initializing Scheduler..." << std::endl;
+  DataScheduler scheduler(&reader);
+  std::cout << "Initializing Writer..." << std::endl;
+  Writer writer(&scheduler);
+
+  std::thread reader_thread(&Reader::read, &reader, "in.bin");
+  std::thread scheduler_thread(&DataScheduler::loop, &scheduler);
+  std::thread writer_thread(&Writer::write, &writer, "out.bin");
+
+  reader_thread.join();
+  scheduler_thread.join();
+  writer_thread.join();
 }
