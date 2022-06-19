@@ -4,6 +4,16 @@
 #include <assert.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <queue>
+#include <string>
+#include <istream>
+#include <ostream>
+#include <fstream>
+#include <iostream>
+#include <thread>
+#include <array>
+#include <mutex>
+#include <optional>
 
 #define cudaCheck(ans)                     \
   {                                        \
@@ -18,157 +28,203 @@ inline void gpu_assert(cudaError_t code, const char *file, int line, bool abort 
       exit(code);
   }
 }
-#define BLOCK_SIZE 16
 
-__global__ void kernel_matrix_mult(float *out, float *a, float *b, int n)
+template <class T, size_t TElemCount>
+class circular_buffer
 {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+public:
+  explicit circular_buffer() = default;
 
-  float tmp_sum = 0;
-
-  if (row < n && col < n)
+  void put(T item)
   {
-    // each thread computes one element of the block sub-matrix
-    for (int i = 0; i < n; i++)
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    buf_[head_] = item;
+
+    if (full_)
     {
-      tmp_sum += a[row * n + i] * b[i * n + col];
+      tail_ = (tail_ + 1) % TElemCount;
     }
-    out[row * n + col] = tmp_sum;
+
+    head_ = (head_ + 1) % TElemCount;
+
+    full_ = head_ == tail_;
   }
-}
 
-// Set up(and cleanup) for the matrix multiplication on the GPU
-void gpu_matrix_mult(float *out, float *a, float *b, int N)
-{
-  int SIZE = N * N;
-  float *d_a, *d_b, *d_out;
+  // __device__ void gpu_put(T *item)
+  // {
+  //   std::lock_guard<std::recursive_mutex> lock(mutex_);
 
-  // Allocate arrays in device memory
-  cudaCheck(cudaMalloc((void **)&d_a, sizeof(float) * SIZE));
-  cudaCheck(cudaMalloc((void **)&d_b, sizeof(float) * SIZE));
-  cudaCheck(cudaMalloc((void **)&d_out, sizeof(float) * SIZE));
+  //   cudaCheck(cudaMemCpy(&buf_[head_], item, sizeof(T), cudaMemcpyHostToDevice));
 
-  // Copy data from the host memory to the device memory
-  cudaCheck(cudaMemcpy(d_a, a, sizeof(float) * SIZE, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(d_b, b, sizeof(float) * SIZE, cudaMemcpyHostToDevice));
+  //   if (full_)
+  //   {
+  //     tail_ = (tail_ + 1) % TElemCount;
+  //   }
 
-  dim3 threads_per_block(BLOCK_SIZE, BLOCK_SIZE);
-  dim3 blocks_per_grid(N / BLOCK_SIZE, N / BLOCK_SIZE);
+  //   head_ = (head_ + 1) % TElemCount;
 
-  printf("using %d threads per block\n", threads_per_block.x * threads_per_block.y);
-  printf("using %d blocks per grid\n", blocks_per_grid.x * blocks_per_grid.y);
+  //   full_ = head_ == tail_;
+  // }
 
-  kernel_matrix_mult<<<blocks_per_grid, threads_per_block>>>(d_out, d_a, d_b, N);
-  cudaCheck(cudaPeekAtLastError());
-  cudaCheck(cudaDeviceSynchronize());
-
-  // Copy result from device memory to the host memory
-  cudaCheck(cudaMemcpy(out, d_out, sizeof(float) * SIZE, cudaMemcpyDeviceToHost));
-  cudaCheck(cudaDeviceSynchronize());
-
-  // Free arrays in device memory
-  cudaCheck(cudaFree(d_a));
-  cudaCheck(cudaFree(d_b));
-  cudaCheck(cudaFree(d_out));
-}
-
-void inspect_gpu()
-{
-  int device;
-  cudaGetDevice(&device);
-  struct cudaDeviceProp properties;
-  cudaGetDeviceProperties(&properties, device);
-  printf("---- GPU INFO -------\n");
-  printf("\tusing %d multiprocessors\n", properties.multiProcessorCount);
-  printf("\tmax blocks per processor: %d\n", properties.maxBlocksPerMultiProcessor);
-  printf("\tmax threads per block: %d\n", properties.maxThreadsPerBlock);
-  printf("\tmax threads per processor: %d\n\n", properties.maxThreadsPerMultiProcessor);
-}
-
-void cpu_matrix_mult(float *out, float *a, float *b, int N)
-{
-  for (int y = 0; y < N; y++)
+  T get()
   {
-    for (int x = 0; x < N; x++)
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    // if (empty())
+    // {
+    //   return std::nullopt;
+    // }
+
+    // Read data and advance the tail (we now have a free space)
+    auto val = buf_[tail_];
+    full_ = false;
+    tail_ = (tail_ + 1) % TElemCount;
+
+    return val;
+  }
+
+  void reset()
+  {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    head_ = tail_;
+    full_ = false;
+  }
+
+  bool empty()
+  {
+    // Can have a race condition in a multi-threaded application
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // if head and tail are equal, we are empty
+    return (!full_ && (head_ == tail_));
+  }
+
+  bool full()
+  {
+    // If tail is ahead the head by 1, we are full
+    return full_;
+  }
+
+  size_t capacity()
+  {
+    return TElemCount;
+  }
+
+  size_t size()
+  {
+    // A lock is needed in size ot prevent a race condition, because head_, tail_, and full_
+    // can be updated between executing lines within this function in a multi-threaded
+    // application
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    size_t size = TElemCount;
+
+    if (!full_)
     {
-      float sum = 0.f;
-      for (int n = 0; n < N; n++)
+      if (head_ >= tail_)
       {
-        sum += a[y * N + n] * b[n * N + x];
+        size = head_ - tail_;
       }
-      out[y * N + x] = sum;
+      else
+      {
+        size = TElemCount + head_ - tail_;
+      }
     }
-  }
-}
 
-double mean_squared_error(float *a, float *b, int N)
+    return size;
+  }
+
+private:
+  mutable std::recursive_mutex mutex_;
+  mutable std::array<T, TElemCount> buf_;
+  mutable size_t head_ = 0;
+  mutable size_t tail_ = 0;
+  mutable bool full_ = 0;
+};
+
+const int N = 16;
+const int SIZE = N * N;
+const int WINDOW = 100;
+
+const uint BUFFER_SIZE = 10000;
+class Block
 {
-  double err = 0;
-  for (int y = 0; y < N; y++)
+  float data[BUFFER_SIZE];
+  uint index;
+
+public:
+  Block(float data[BUFFER_SIZE], uint index)
   {
-    for (int x = 0; x < N; x++)
+    std::copy(data, data + BUFFER_SIZE, this->data);
+    this->index = index;
+  };
+};
+
+class Reader
+{
+  static const size_t BUFFER_COUNT = 100;
+
+public:
+  bool done = false;
+  uint read_until = 0;
+  circular_buffer<Block, Reader::BUFFER_COUNT> value_buffer;
+  explicit Reader() = default;
+  float *read(std::string filename)
+  {
+    std::ifstream in_file(filename, std::ifstream::binary);
+    if (!in_file)
     {
-      int i = y * N + x;
-      err += pow(a[i] - b[i], 2);
+      std::cerr << "Failed opening file" << std::endl;
+      exit(1);
+    }
+
+    // Stop eating new lines in binary mode!!!
+    in_file.unsetf(std::ios::skipws);
+
+    while (!in_file.eof())
+    {
+      while (value_buffer.full())
+      {
+      }
+      float *read_buffer = new float[BUFFER_SIZE];
+      in_file.read((char *)read_buffer, BUFFER_SIZE * sizeof(float));
+      value_buffer.put(Block(read_buffer, read_until));
+      read_until += BUFFER_SIZE;
+    }
+    done = true;
+    in_file.close();
+  }
+};
+
+class DataScheduler
+{
+  static const size_t BUFFER_COUNT = 100;
+  Reader *reader;
+  uint processed_until = 0;
+  // circular_buffer<Block, DataScheduler::BUFFER_COUNT> *device_buffer;
+
+public:
+  DataScheduler(Reader *reader)
+  {
+    this->reader = reader;
+    // cudaCheck(cudaMalloc(&device_buffer, sizeof(circular_buffer<float, DataScheduler::BUFFER_COUNT>)));
+  }
+
+  void loop()
+  {
+    while (!reader->done)
+    {
+      while (reader->value_buffer.empty())
+      {
+      }
+
+      auto block = reader->value_buffer.get();
+      // device_buffer->gpu_put(&block);
     }
   }
-  return err;
-}
+};
 
 int main()
 {
-  int N = 1024;
-  int SIZE = N * N;
-
-  float *a = (float *)malloc(sizeof(float) * SIZE);
-  float *b = (float *)malloc(sizeof(float) * SIZE);
-
-  // Initialize matrices on the host
-  for (int i = 0; i < N; i++)
-  {
-    for (int j = 0; j < N; j++)
-    {
-      a[i * N + j] = sin(i);
-      b[i * N + j] = cos(j);
-    }
-  }
-
-  inspect_gpu();
-
-  // Allocate CUDA events that we'll use for timing
-  cudaEvent_t start, stop;
-  cudaCheck(cudaEventCreate(&start));
-  cudaCheck(cudaEventCreate(&stop));
-
-  float *out = (float *)malloc(sizeof(float) * SIZE);
-  cudaCheck(cudaEventRecord(start));
-  cudaCheck(cudaEventSynchronize(start));
-  gpu_matrix_mult(out, a, b, N);
-  cudaCheck(cudaEventRecord(stop));
-  cudaCheck(cudaEventSynchronize(stop));
-  float gpu_msec_total = 0.0f;
-  cudaCheck(cudaEventElapsedTime(&gpu_msec_total, start, stop));
-
-  float *cpu_out = (float *)malloc(sizeof(float) * SIZE);
-  cudaCheck(cudaEventRecord(start));
-  cudaCheck(cudaEventSynchronize(start));
-  cpu_matrix_mult(cpu_out, a, b, N);
-  cudaCheck(cudaEventRecord(stop));
-  cudaCheck(cudaEventSynchronize(stop));
-  float cpu_msec_total = 0.0f;
-  cudaCheck(cudaEventElapsedTime(&cpu_msec_total, start, stop));
-
-  double err = mean_squared_error(out, cpu_out, N);
-
-  printf("Mean squared error: %f\n", err);
-  printf("Time elapsed GPU: %.2fms. CPU: %.2fms\n", gpu_msec_total, cpu_msec_total);
-
-  // Deallocate host memory
-  free(a);
-  free(b);
-  free(out);
-  free(cpu_out);
-  cudaCheck(cudaEventDestroy(start));
-  cudaCheck(cudaEventDestroy(stop));
+  Reader reader();
 }
