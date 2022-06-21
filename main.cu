@@ -29,6 +29,8 @@ inline void gpu_assert(cudaError_t code, const char *file, int line, bool abort 
   }
 }
 
+#define KERNEL_BLOCK_SIZE 16
+
 template <class T, size_t TElemCount>
 class circular_buffer
 {
@@ -41,7 +43,7 @@ public:
 
   void put(T item)
   {
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     buf_[head_] = item;
 
@@ -73,7 +75,7 @@ public:
 
   T get()
   {
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     // if (empty())
     // {
@@ -90,7 +92,7 @@ public:
 
   void reset()
   {
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     head_ = tail_;
     full_ = false;
   }
@@ -98,7 +100,7 @@ public:
   bool empty()
   {
     // Can have a race condition in a multi-threaded application
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     // if head and tail are equal, we are empty
     return (!full_ && (head_ == tail_));
   }
@@ -119,7 +121,7 @@ public:
     // A lock is needed in size ot prevent a race condition, because head_, tail_, and full_
     // can be updated between executing lines within this function in a multi-threaded
     // application
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     size_t size = TElemCount;
 
@@ -139,7 +141,7 @@ public:
   }
 
 private:
-  // mutable std::recursive_mutex mutex_;
+  mutable std::recursive_mutex mutex_;
   mutable std::array<T, TElemCount> buf_;
   mutable size_t head_ = 0;
   mutable size_t tail_ = 0;
@@ -148,16 +150,38 @@ private:
 
 const int WINDOW = 100;
 
-const uint BUFFER_SIZE = 10000;
-class Block
+const uint BUFFER_SIZE = KERNEL_BLOCK_SIZE * 64;
+const uint CHUNK_SIZE = BUFFER_SIZE + WINDOW;
+class Chunk
 {
-  uint index;
-
 public:
-  Block() = default;
-  std::array<float, BUFFER_SIZE> data;
-  Block(std::array<float, BUFFER_SIZE> data, uint index) : data(data), index(index){};
+  uint index;
+  Chunk() = default;
+  float data[CHUNK_SIZE];
+  Chunk(std::array<float, CHUNK_SIZE> data, uint index) : index(index)
+  {
+    std::copy(data.begin(), data.end(), this->data);
+  };
 };
+
+__global__ void kernel_matrix_mult(Chunk *out, Chunk *chunk)
+{
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (chunk->index == 0 && index < WINDOW)
+  {
+    return;
+  }
+
+  float tmp_sum = 0;
+  // each thread computes one element of the block sub-matrix
+  for (int i = WINDOW; i > 0; i--)
+  {
+    tmp_sum += chunk->data[index - i + WINDOW];
+  }
+  out->data[index] = tmp_sum;
+  out->index = chunk->index;
+}
 
 class Reader
 {
@@ -166,9 +190,10 @@ class Reader
 public:
   bool done = false;
   uint read_until = 0;
-  circular_buffer<Block, Reader::BUFFER_COUNT> value_buffer;
+  circular_buffer<Chunk *, Reader::BUFFER_COUNT> value_buffer;
+  Chunk *previous_chunk;
   explicit Reader(){};
-  // explicit Reader() = default;
+
   float *read(std::string filename)
   {
     std::ifstream in_file(filename, std::ifstream::binary);
@@ -188,8 +213,16 @@ public:
       }
       std::array<float, BUFFER_SIZE> read_buffer;
       in_file.read((char *)read_buffer.data(), BUFFER_SIZE * sizeof(float));
-      value_buffer.put(Block(read_buffer, read_until));
+      std::array<float, CHUNK_SIZE> chunk_read_buffer;
+      std::copy(read_buffer.begin(), read_buffer.end(), &chunk_read_buffer.at(WINDOW));
+      if (previous_chunk != nullptr)
+      {
+        std::copy(std::end(previous_chunk->data) - WINDOW, std::end(previous_chunk->data), chunk_read_buffer.begin());
+      }
+      Chunk *chunk = new Chunk(chunk_read_buffer, read_until);
+      value_buffer.put(chunk);
       read_until += BUFFER_SIZE;
+      previous_chunk = chunk;
     }
     done = true;
     in_file.close();
@@ -202,24 +235,52 @@ class DataScheduler
   static const size_t OUT_BUFFER_COUNT = 100;
   Reader *reader;
   uint processed_until = 0;
-  // circular_buffer<Block, DataScheduler::BUFFER_COUNT> *device_buffer;
 
 public:
   bool done = false;
   // must write to buffer in the given order(ascending block index)
-  circular_buffer<Block, DataScheduler::OUT_BUFFER_COUNT> out_buffer;
+  circular_buffer<Chunk, DataScheduler::OUT_BUFFER_COUNT> out_buffer;
   explicit DataScheduler(Reader *reader) : reader(reader){};
 
   void loop()
   {
-    while (!reader->done)
+    int current_stream = 0;
+    while (!reader->done || !reader->value_buffer.empty())
     {
       while (reader->value_buffer.empty())
       {
       }
 
-      auto block = reader->value_buffer.get();
-      // device_buffer->gpu_put(&block);
+      // We use streams to synchronize executions callbacks in the GPU.
+      Chunk *chunk = reader->value_buffer.get();
+      Chunk *device_chunk;
+      Chunk *device_output_chunk;
+
+      cudaCheck(cudaMalloc(&device_chunk, sizeof(Chunk)));
+      cudaCheck(cudaMalloc(&device_output_chunk, sizeof(Chunk)));
+      cudaCheck(cudaMemcpy(device_chunk, chunk, sizeof(Chunk), cudaMemcpyHostToDevice));
+      dim3 threads_per_block(KERNEL_BLOCK_SIZE);
+      dim3 blocks_per_grid(BUFFER_SIZE / KERNEL_BLOCK_SIZE);
+
+      printf("using %d threads per block\n", threads_per_block.x * threads_per_block.y);
+      printf("using %d blocks per grid\n", blocks_per_grid.x * blocks_per_grid.y);
+      printf("EU SINTO ESSE MOMENTO LINDO\n");
+      kernel_matrix_mult<<<blocks_per_grid, threads_per_block>>>(device_output_chunk, device_chunk);
+      // cudaCheck(cudaPeekAtLastError());
+      // cudaCheck(cudaDeviceSynchronize());
+      std::printf("QUANDO EU ESTOU AQUI\n");
+
+      Chunk output_chunk;
+      // Copy result from device memory to the host memory
+      cudaCheck(cudaMemcpy(&output_chunk, device_output_chunk, sizeof(Chunk), cudaMemcpyDeviceToHost));
+
+      this->out_buffer.put(output_chunk);
+      free(chunk);
+      for (int i = 90; i < 110; i++)
+        std::printf("%f\n", output_chunk.data[i]);
+      // Free arrays in device memory
+      cudaCheck(cudaFree(device_chunk));
+      cudaCheck(cudaFree(device_output_chunk));
     }
     done = true;
   }
@@ -242,12 +303,19 @@ public:
       exit(1);
     }
 
-    while (!scheduler->done)
+  
+    while (!scheduler->done || !scheduler->out_buffer.empty())
     {
-      while (scheduler->out_buffer.empty())
-        ;
-      out_file.write((char *)scheduler->out_buffer.get().data.data(), BUFFER_SIZE * sizeof(float));
+      while (scheduler->out_buffer.empty()) {
+        if (scheduler->done) {
+          goto loop_end;
+        }
+      }
+      Chunk chunk = scheduler->out_buffer.get();
+      out_file.write((char *)chunk.data, BUFFER_SIZE * sizeof(float));
+      printf("INDICE DO CHUNK %d\n", chunk.index);
     }
+loop_end:
     done = true;
     out_file.close();
   }
@@ -267,6 +335,9 @@ int main()
   std::thread writer_thread(&Writer::write, &writer, "out.bin");
 
   reader_thread.join();
+  std::cout << "Finished Reader..." << std::endl;
   scheduler_thread.join();
+  std::cout << "Finished Scheduler..." << std::endl;
   writer_thread.join();
+  std::cout << "Finished Writer..." << std::endl;
 }
