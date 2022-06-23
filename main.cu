@@ -14,6 +14,8 @@
 #include <array>
 #include <mutex>
 #include <optional>
+#include <ctime>
+#include <chrono>
 
 #define cudaCheck(ans)                     \
   {                                        \
@@ -184,6 +186,8 @@ public:
     // Stop eating new lines in binary mode!!!
     in_file.unsetf(std::ios::skipws);
 
+    auto start = std::chrono::system_clock::now();
+    int read_size = 0;
     while (!in_file.eof())
     {
       while (value_buffer.full())
@@ -201,7 +205,12 @@ public:
       value_buffer.put(chunk);
       read_until += BUFFER_SIZE;
       previous_chunk = chunk;
+      read_size += BUFFER_SIZE * sizeof(float);
     }
+    auto end = std::chrono::system_clock::now();
+    auto time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    float mean = ((float)read_size/(float)time_diff);
+    std::printf("READER:\nTempo: %d\nLido: %d\nMédia: %f\n\n", time_diff, read_size, mean);
     done = true;
     in_file.close();
   }
@@ -223,6 +232,8 @@ public:
   void loop()
   {
     int current_stream = 0;
+    // auto start = std::chrono::system_clock::now();
+    // int read_size = 0;
     while (!reader->done || !reader->value_buffer.empty())
     {
       while (reader->value_buffer.empty())
@@ -255,7 +266,12 @@ public:
       // Free arrays in device memory
       cudaCheck(cudaFree(device_chunk));
       cudaCheck(cudaFree(device_output_chunk));
+      // read_size += BUFFER_SIZE * sizeof(float);
     }
+    // auto end = std::chrono::system_clock::now();
+    // auto time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    // float mean = ((float)read_size/(float)time_diff);
+    // std::printf("READER:\nTempo: %d\nLido: %d\nMédia: %f\n\n", time_diff, read_size, mean);
     done = true;
   }
 };
@@ -276,8 +292,9 @@ public:
       std::cerr << "Failed opening file" << std::endl;
       exit(1);
     }
-
   
+    auto start = std::chrono::system_clock::now();
+    int read_size = 0;
     while (!scheduler->done || !scheduler->out_buffer.empty())
     {
       while (scheduler->out_buffer.empty()) {
@@ -287,8 +304,13 @@ public:
       }
       Chunk chunk = scheduler->out_buffer.get();
       out_file.write((char *)chunk.data, BUFFER_SIZE * sizeof(float));
+      read_size += BUFFER_SIZE * sizeof(float);
     }
 loop_end:
+    auto end = std::chrono::system_clock::now();
+    auto time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+    float mean = ((float)read_size/(float)time_diff);
+    std::printf("WRITER:\nTempo: %d\nLido: %d\nMédia: %f\n\n", time_diff, read_size, mean);
     done = true;
     out_file.close();
   }
