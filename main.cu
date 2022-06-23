@@ -35,7 +35,6 @@ template <class T, size_t TElemCount>
 class circular_buffer
 {
 public:
-  // circular_buffer() = default;
   explicit circular_buffer()
   {
     buf_ = {};
@@ -57,30 +56,9 @@ public:
     full_ = head_ == tail_;
   }
 
-  // __device__ void gpu_put(T *item)
-  // {
-  //   std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-  //   cudaCheck(cudaMemCpy(&buf_[head_], item, sizeof(T), cudaMemcpyHostToDevice));
-
-  //   if (full_)
-  //   {
-  //     tail_ = (tail_ + 1) % TElemCount;
-  //   }
-
-  //   head_ = (head_ + 1) % TElemCount;
-
-  //   full_ = head_ == tail_;
-  // }
-
   T get()
   {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    // if (empty())
-    // {
-    //   return std::nullopt;
-    // }
 
     // Read data and advance the tail (we now have a free space)
     auto val = buf_[tail_];
@@ -264,11 +242,8 @@ public:
 
       printf("using %d threads per block\n", threads_per_block.x * threads_per_block.y);
       printf("using %d blocks per grid\n", blocks_per_grid.x * blocks_per_grid.y);
-      printf("EU SINTO ESSE MOMENTO LINDO\n");
+
       kernel_matrix_mult<<<blocks_per_grid, threads_per_block>>>(device_output_chunk, device_chunk);
-      // cudaCheck(cudaPeekAtLastError());
-      // cudaCheck(cudaDeviceSynchronize());
-      std::printf("QUANDO EU ESTOU AQUI\n");
 
       Chunk output_chunk;
       // Copy result from device memory to the host memory
@@ -276,8 +251,7 @@ public:
 
       this->out_buffer.put(output_chunk);
       free(chunk);
-      for (int i = 90; i < 110; i++)
-        std::printf("%f\n", output_chunk.data[i]);
+
       // Free arrays in device memory
       cudaCheck(cudaFree(device_chunk));
       cudaCheck(cudaFree(device_output_chunk));
@@ -313,7 +287,6 @@ public:
       }
       Chunk chunk = scheduler->out_buffer.get();
       out_file.write((char *)chunk.data, BUFFER_SIZE * sizeof(float));
-      printf("INDICE DO CHUNK %d\n", chunk.index);
     }
 loop_end:
     done = true;
@@ -335,9 +308,6 @@ int main()
   std::thread writer_thread(&Writer::write, &writer, "out.bin");
 
   reader_thread.join();
-  std::cout << "Finished Reader..." << std::endl;
   scheduler_thread.join();
-  std::cout << "Finished Scheduler..." << std::endl;
   writer_thread.join();
-  std::cout << "Finished Writer..." << std::endl;
 }
