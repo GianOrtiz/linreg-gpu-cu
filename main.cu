@@ -186,7 +186,7 @@ public:
     // Stop eating new lines in binary mode!!!
     in_file.unsetf(std::ios::skipws);
 
-    auto start = std::chrono::system_clock::now();
+    auto start = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     int read_size = 0;
     while (!in_file.eof())
     {
@@ -207,11 +207,11 @@ public:
       previous_chunk = chunk;
       read_size += BUFFER_SIZE * sizeof(float);
     }
-    auto end = std::chrono::system_clock::now();
-    auto time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-    // read_size in bytes, time_diff in nanoseconds
+    auto end = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
+    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    // read_size in bytes, time_diff in milliseconds
     float mean = ((float)read_size/(float)time_diff);
-    std::printf("READER:\nTempo: %dns\nLido: %d bytes\nMédia: %f bytes/ns\n\n", time_diff, read_size, mean);
+    std::printf("WRITER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
     done = true;
     in_file.close();
   }
@@ -287,7 +287,7 @@ public:
       exit(1);
     }
   
-    auto start = std::chrono::system_clock::now();
+    auto start = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     int read_size = 0;
     while (!scheduler->done || !scheduler->out_buffer.empty())
     {
@@ -301,11 +301,11 @@ public:
       read_size += BUFFER_SIZE * sizeof(float);
     }
 loop_end:
-    auto end = std::chrono::system_clock::now();
-    auto time_diff = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-    // read_size in bytes, time_diff in nanoseconds
+    auto end = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
+    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    // read_size in bytes, time_diff in milliseconds
     float mean = ((float)read_size/(float)time_diff);
-    std::printf("WRITER:\nTempo: %dns\nLido: %d bytes\nMédia: %f bytes/ns\n\n", time_diff, read_size, mean);
+    std::printf("WRITER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
     done = true;
     out_file.close();
   }
