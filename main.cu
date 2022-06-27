@@ -211,7 +211,7 @@ public:
     auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
     // read_size in bytes, time_diff in milliseconds
     float mean = ((float)read_size/(float)time_diff);
-    std::printf("WRITER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
+    std::printf("READER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
     done = true;
     in_file.close();
   }
