@@ -163,6 +163,7 @@ __global__ void kernel_matrix_mult(Chunk *out, Chunk *chunk)
   out->index = chunk->index;
 }
 
+// reads a one-dimensional CSV file
 class Reader
 {
   static const size_t BUFFER_COUNT = 100;
@@ -188,19 +189,26 @@ public:
 
     auto start = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     int read_size = 0;
+
+    std::string line{};
+    // read the first line(column headers)
+    std::getline(in_file, line);
     while (!in_file.eof())
     {
       while (value_buffer.full())
       {
       }
       std::array<float, BUFFER_SIZE> read_buffer;
-      in_file.read((char *)read_buffer.data(), BUFFER_SIZE * sizeof(float));
+      size_t i = 0;
+      while (std::getline(in_file, line) && i < BUFFER_SIZE)
+        read_buffer[i++] = std::stof(line);
       std::array<float, CHUNK_SIZE> chunk_read_buffer;
       std::copy(read_buffer.begin(), read_buffer.end(), &chunk_read_buffer.at(WINDOW));
       if (previous_chunk != nullptr)
       {
         std::copy(std::end(previous_chunk->data) - WINDOW, std::end(previous_chunk->data), chunk_read_buffer.begin());
       }
+
       Chunk *chunk = new Chunk(chunk_read_buffer, read_until);
       value_buffer.put(chunk);
       read_until += BUFFER_SIZE;
@@ -208,9 +216,9 @@ public:
       read_size += BUFFER_SIZE * sizeof(float);
     }
     auto end = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
-    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     // read_size in bytes, time_diff in milliseconds
-    float mean = ((float)read_size/(float)time_diff);
+    float mean = ((float)read_size / (float)time_diff);
     std::printf("READER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
     done = true;
     in_file.close();
@@ -270,6 +278,7 @@ public:
   }
 };
 
+// writes to a one-dimensional CSV file
 class Writer
 {
   static const size_t BUFFER_COUNT = 100;
@@ -286,25 +295,32 @@ public:
       std::cerr << "Failed opening file" << std::endl;
       exit(1);
     }
-  
+
     auto start = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     int read_size = 0;
+    // write column header
+    out_file << "x" << std::endl;
     while (!scheduler->done || !scheduler->out_buffer.empty())
     {
-      while (scheduler->out_buffer.empty()) {
-        if (scheduler->done) {
+      while (scheduler->out_buffer.empty())
+      {
+        if (scheduler->done)
+        {
           goto loop_end;
         }
       }
       Chunk chunk = scheduler->out_buffer.get();
-      out_file.write((char *)chunk.data, BUFFER_SIZE * sizeof(float));
+      for (size_t i = 0; i < BUFFER_SIZE; i++)
+      {
+        out_file << std::to_string(chunk.data[i]) << std::endl;
+      }
       read_size += BUFFER_SIZE * sizeof(float);
     }
-loop_end:
+  loop_end:
     auto end = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
-    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
+    auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     // read_size in bytes, time_diff in milliseconds
-    float mean = ((float)read_size/(float)time_diff);
+    float mean = ((float)read_size / (float)time_diff);
     std::printf("WRITER:\nTempo: %dms\nLido: %d bytes\nMédia: %f bytes/ms\n\n", time_diff, read_size, mean);
     done = true;
     out_file.close();
@@ -320,9 +336,9 @@ int main()
   std::cout << "Initializing Writer..." << std::endl;
   Writer writer(&scheduler);
 
-  std::thread reader_thread(&Reader::read, &reader, "in.bin");
+  std::thread reader_thread(&Reader::read, &reader, "in.csv");
   std::thread scheduler_thread(&DataScheduler::loop, &scheduler);
-  std::thread writer_thread(&Writer::write, &writer, "out.bin");
+  std::thread writer_thread(&Writer::write, &writer, "out.csv");
 
   reader_thread.join();
   scheduler_thread.join();
