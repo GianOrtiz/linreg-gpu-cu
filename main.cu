@@ -132,6 +132,7 @@ const int WINDOW = 100;
 
 const uint BUFFER_SIZE = KERNEL_BLOCK_SIZE * 64;
 const uint CHUNK_SIZE = BUFFER_SIZE + WINDOW;
+const uint OUT_CHUNK_SIZE = (2 * CHUNK_SIZE);
 class Chunk
 {
 public:
@@ -139,6 +140,17 @@ public:
   Chunk() = default;
   float data[CHUNK_SIZE];
   Chunk(std::array<float, CHUNK_SIZE> data, uint index) : index(index)
+  {
+    std::copy(data.begin(), data.end(), this->data);
+  };
+};
+class OutChunk
+{
+public:
+  uint index;
+  OutChunk() = default;
+  float data[OUT_CHUNK_SIZE];
+  OutChunk(std::array<float, OUT_CHUNK_SIZE> data, uint index) : index(index)
   {
     std::copy(data.begin(), data.end(), this->data);
   };
@@ -158,7 +170,7 @@ public:
 // (X^T * X) is 2 x 2
 // (X^T * X)^-1 is 2 x 2
 // (X^T * X)^-1 * X^T is 2 x n
-__global__ void kernel_matrix_mult(Chunk *weight, Chunk *chunk)
+__global__ void kernel_matrix_mult(OutChunk *weight, Chunk *chunk)
 {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -167,9 +179,10 @@ __global__ void kernel_matrix_mult(Chunk *weight, Chunk *chunk)
     return;
   }
 
-  float tmp_sum = 0;
+  float b_0 = 0;
+  float b_1 = 0;
 
-#define X(i) (SAMPLE_PERIOD_MS * i)
+#define X(i) (index + SAMPLE_PERIOD_MS * i)
 
   float tmp_inv_matrix[4] = {0, 0, 0, 0}; // (X^T * X)
   float inv_matrix[4] = {0, 0, 0, 0};     // (X^T * X)^-1
@@ -189,20 +202,22 @@ __global__ void kernel_matrix_mult(Chunk *weight, Chunk *chunk)
   inv_matrix[3] = inv_det * tmp_inv_matrix[0];
 
   float inv_times_xt[WINDOW * 2] = {}; // (X^T * X)^-1 * X^T
-  for (int i = WINDOW; i > 0; i--)
+  for (int i = WINDOW; i > 0; i -= 2)
   {
     // [a, b] * [1   1 ...  1 ]
     // [c, b]   [x0 x1 ... xn ]
-    inv_times_xt[i * 2] = inv_matrix[0] * 1 + inv_matrix[1] * X(i);
-    inv_times_xt[i * 2 + 1] = inv_matrix[2] * 1 + inv_matrix[3] * X(i);
+    inv_times_xt[i] = inv_matrix[0] * 1 + inv_matrix[1] * X(i);
+    inv_times_xt[i + 1] = inv_matrix[2] * 1 + inv_matrix[3] * X(i);
   }
   // each thread computes one element of the block sub-matrix
   for (int i = WINDOW; i > 0; i--)
   {
     auto Y = chunk->data;
-    tmp_sum += inv_times_xt[i] * Y[i];
+    b_0 += inv_times_xt[i] * Y[i + index];
+    b_1 += inv_times_xt[WINDOW + i] * Y[i + index];
   }
-  weight->data[index] = tmp_sum;
+  weight->data[2 * index] = b_0;
+  weight->data[2 * index + 1] = b_1;
   weight->index = chunk->index;
 }
 
@@ -278,7 +293,7 @@ class DataScheduler
 public:
   bool done = false;
   // must write to buffer in the given order(ascending block index)
-  circular_buffer<Chunk, DataScheduler::OUT_BUFFER_COUNT> out_buffer;
+  circular_buffer<OutChunk, DataScheduler::OUT_BUFFER_COUNT> out_buffer;
   explicit DataScheduler(Reader *reader) : reader(reader){};
 
   void loop()
@@ -293,10 +308,10 @@ public:
       // We use streams to synchronize executions callbacks in the GPU.
       Chunk *chunk = reader->value_buffer.get();
       Chunk *device_chunk;
-      Chunk *device_output_chunk;
+      OutChunk *device_output_chunk;
 
       cudaCheck(cudaMalloc(&device_chunk, sizeof(Chunk)));
-      cudaCheck(cudaMalloc(&device_output_chunk, sizeof(Chunk)));
+      cudaCheck(cudaMalloc(&device_output_chunk, sizeof(OutChunk)));
       cudaCheck(cudaMemcpy(device_chunk, chunk, sizeof(Chunk), cudaMemcpyHostToDevice));
       dim3 threads_per_block(KERNEL_BLOCK_SIZE);
       dim3 blocks_per_grid(BUFFER_SIZE / KERNEL_BLOCK_SIZE);
@@ -306,9 +321,9 @@ public:
 
       kernel_matrix_mult<<<blocks_per_grid, threads_per_block>>>(device_output_chunk, device_chunk);
 
-      Chunk output_chunk;
+      OutChunk output_chunk;
       // Copy result from device memory to the host memory
-      cudaCheck(cudaMemcpy(&output_chunk, device_output_chunk, sizeof(Chunk), cudaMemcpyDeviceToHost));
+      cudaCheck(cudaMemcpy(&output_chunk, device_output_chunk, sizeof(OutChunk), cudaMemcpyDeviceToHost));
 
       this->out_buffer.put(output_chunk);
       free(chunk);
@@ -342,7 +357,7 @@ public:
     auto start = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
     int read_size = 0;
     // write column header
-    out_file << "x" << std::endl;
+    out_file << "b_0, b_1" << std::endl;
     while (!scheduler->done || !scheduler->out_buffer.empty())
     {
       while (scheduler->out_buffer.empty())
@@ -352,10 +367,10 @@ public:
           goto loop_end;
         }
       }
-      Chunk chunk = scheduler->out_buffer.get();
-      for (size_t i = 0; i < BUFFER_SIZE; i++)
+      OutChunk chunk = scheduler->out_buffer.get();
+      for (size_t i = 0; i < BUFFER_SIZE; i += 2)
       {
-        out_file << std::to_string(chunk.data[i]) << std::endl;
+        out_file << std::to_string(chunk.data[i]) << ", " << std::to_string(chunk.data[i + 1]) << std::endl;
       }
       read_size += BUFFER_SIZE * sizeof(float);
     }
