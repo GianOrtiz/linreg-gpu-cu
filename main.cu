@@ -144,7 +144,21 @@ public:
   };
 };
 
-__global__ void kernel_matrix_mult(Chunk *out, Chunk *chunk)
+#define SAMPLE_PERIOD_MS 10
+// weight is the weight matrix
+// weight is calculated as follows
+// weight = (X^T * X)^-1 * X^T * Y
+// where X is the input matrix, Y is the output matrix
+// X is not-provided, as the samples are provided regularly in time
+// so we can calculate the X from the index(index * SAMPLE_PERIOD_MS)
+// X is n x 2
+// Y is n x 2
+// B(weight) is 2 x 2
+// X^T is 2 x n
+// (X^T * X) is 2 x 2
+// (X^T * X)^-1 is 2 x 2
+// (X^T * X)^-1 * X^T is 2 x n
+__global__ void kernel_matrix_mult(Chunk *weight, Chunk *chunk)
 {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -154,13 +168,42 @@ __global__ void kernel_matrix_mult(Chunk *out, Chunk *chunk)
   }
 
   float tmp_sum = 0;
+
+#define X(i) (SAMPLE_PERIOD_MS * i)
+
+  float tmp_inv_matrix[4] = {0, 0, 0, 0}; // (X^T * X)
+  float inv_matrix[4] = {0, 0, 0, 0};     // (X^T * X)^-1
+  for (int i = WINDOW; i > 0; i--)
+  {
+    tmp_inv_matrix[0] += 1 * 1;
+    tmp_inv_matrix[1] += X(i) * 1;
+    tmp_inv_matrix[2] += 1 * X(i);
+    tmp_inv_matrix[3] += X(i) * X(i);
+  }
+  // inverse of matrix
+  // (1 / (a*d - b*c)) * [d, -b; -c, a]
+  auto inv_det = 1 / (tmp_inv_matrix[0] * tmp_inv_matrix[3] - tmp_inv_matrix[1] * tmp_inv_matrix[2]);
+  inv_matrix[0] = inv_det * tmp_inv_matrix[3];
+  inv_matrix[1] = -inv_det * tmp_inv_matrix[1];
+  inv_matrix[2] = -inv_det * tmp_inv_matrix[2];
+  inv_matrix[3] = inv_det * tmp_inv_matrix[0];
+
+  float inv_times_xt[WINDOW * 2] = {}; // (X^T * X)^-1 * X^T
+  for (int i = WINDOW; i > 0; i--)
+  {
+    // [a, b] * [1   1 ...  1 ]
+    // [c, b]   [x0 x1 ... xn ]
+    inv_times_xt[i * 2] = inv_matrix[0] * 1 + inv_matrix[1] * X(i);
+    inv_times_xt[i * 2 + 1] = inv_matrix[2] * 1 + inv_matrix[3] * X(i);
+  }
   // each thread computes one element of the block sub-matrix
   for (int i = WINDOW; i > 0; i--)
   {
-    tmp_sum += chunk->data[index - i + WINDOW];
+    auto Y = chunk->data;
+    tmp_sum += inv_times_xt[i] * Y[i];
   }
-  out->data[index] = tmp_sum;
-  out->index = chunk->index;
+  weight->data[index] = tmp_sum;
+  weight->index = chunk->index;
 }
 
 // reads a one-dimensional CSV file
